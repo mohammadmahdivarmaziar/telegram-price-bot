@@ -8,256 +8,606 @@ import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont
 
-from config import BOT_TOKEN, CHAT_ID, HISTORY_FILE, MAX_POINTS, TGJU_URL
+from config import BOT_TOKEN, CHAT_ID, HISTORY_FILE, MAX_POINTS
 
 TEHRAN = ZoneInfo("Asia/Tehran")
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0 Safari/537.36"
+    ),
+    "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8",
 }
 
-
-def fa_to_en(s):
-    return str(s).translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٬", "0123456789,"))
-
-
-def parse_number(s):
-    s = fa_to_en(s)
-    s = re.sub(r"[^0-9.-]", "", s.replace(",", ""))
-    return float(s) if s else None
+USD_URL = "https://www.tgju.org/profile/price_dollar_rl"
+GOLD_URL = "https://www.tgju.org/profile/geram18"
 
 
-def toman(n):
-    return round(n / 10)
+def fa_to_en(text):
+    return str(text).translate(
+        str.maketrans(
+            "۰۱۲۳۴۵۶۷۸۹٬",
+            "0123456789,"
+        )
+    )
 
 
-def fmt(n):
-    return f"{int(round(n)):,}"
+def parse_price(text):
+    text = fa_to_en(text)
+    text = text.replace(",", "").replace("٬", "")
+    numbers = re.findall(r"\d+(?:\.\d+)?", text)
+
+    if not numbers:
+        return None
+
+    return float(numbers[0])
+
+
+def get_tgju_price(url):
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
+
+    # روش اصلی TGJU
+    span = soup.find("span", class_="value")
+
+    if span:
+        value = span.get_text(
+            " ",
+            strip=True
+        )
+
+        price = parse_price(value)
+
+        if price:
+            return price
+
+    # روش جایگزین
+    selectors = [
+        '[data-field="price"]',
+        '[data-price]',
+        '.price',
+        '.value',
+    ]
+
+    for selector in selectors:
+        element = soup.select_one(selector)
+
+        if not element:
+            continue
+
+        raw = (
+            element.get("data-price")
+            or element.get_text(" ", strip=True)
+        )
+
+        price = parse_price(raw)
+
+        if price:
+            return price
+
+    raise RuntimeError(
+        f"Could not extract price from {url}"
+    )
+
+
+def fetch_prices():
+    usd_rial = get_tgju_price(USD_URL)
+    gold_rial = get_tgju_price(GOLD_URL)
+
+    if usd_rial is None:
+        raise RuntimeError(
+            "USD price not found"
+        )
+
+    if gold_rial is None:
+        raise RuntimeError(
+            "Gold 18 price not found"
+        )
+
+    # TGJU قیمت‌ها را ریالی می‌دهد.
+    usd_toman = round(usd_rial / 10)
+    gold_toman = round(gold_rial / 10)
+
+    return usd_toman, gold_toman
 
 
 def load_history():
     if not os.path.exists(HISTORY_FILE):
-        return {"usd": [], "gold18": []}
+        return {
+            "usd": [],
+            "gold18": []
+        }
+
     try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        with open(
+            HISTORY_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
             return json.load(f)
+
     except Exception:
-        return {"usd": [], "gold18": []}
+        return {
+            "usd": [],
+            "gold18": []
+        }
 
 
-def save_history(h):
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(h, f, ensure_ascii=False, indent=2)
-
-
-def extract_price_from_page(text, keywords):
-    # تلاش عمومی برای پیدا کردن عدد نزدیک کلیدواژه‌ها
-    for keyword in keywords:
-        pos = text.find(keyword)
-        if pos >= 0:
-            chunk = text[pos:pos + 1200]
-            nums = re.findall(r"[۰-۹0-9][۰-۹0-9,٬]{4,}", chunk)
-            values = [parse_number(x) for x in nums]
-            values = [x for x in values if x and x > 1000]
-            if values:
-                return values[0]
-    return None
-
-
-def fetch_prices():
-    r = requests.get(TGJU_URL, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text(" ", strip=True)
-
-    # TGJU معمولاً قیمت‌ها را به ریال نمایش می‌دهد.
-    usd_ri = extract_price_from_page(
-        text, ["دلار", "دلار آمریکا", "قیمت دلار"]
-    )
-    gold_ri = extract_price_from_page(
-        text, ["طلای 18", "طلای ۱۸", "طلا ۱۸", "طلای ۱۸ عیار"]
-    )
-
-    if usd_ri is None or gold_ri is None:
-        raise RuntimeError(
-            f"Could not find prices on TGJU. USD={usd_ri}, GOLD={gold_ri}"
+def save_history(history):
+    with open(
+        HISTORY_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            history,
+            f,
+            ensure_ascii=False,
+            indent=2
         )
 
-    return toman(usd_ri), toman(gold_ri)
 
-
-def pct_change(points):
-    if len(points) < 2 or not points[-2]["value"]:
+def percent_change(points):
+    if len(points) < 2:
         return 0.0
-    return (points[-1]["value"] - points[-2]["value"]) / points[-2]["value"] * 100
+
+    previous = points[-2]["value"]
+    current = points[-1]["value"]
+
+    if previous == 0:
+        return 0.0
+
+    return (
+        (current - previous)
+        / previous
+        * 100
+    )
 
 
-def font(size, bold=False):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+def fmt(value):
+    return f"{int(round(value)):,}"
+
+
+def get_font(size, bold=False):
+
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold
         else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+
         "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
-        "C:/Windows/Fonts/arial.ttf",
+
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
     ]
-    for p in candidates:
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size)
+
+    for path in paths:
+        if os.path.exists(path):
+            return ImageFont.truetype(
+                path,
+                size
+            )
+
     return ImageFont.load_default()
 
 
-def chart(draw, points, box, line_width=4):
+def draw_chart(draw, points, box):
+
     x0, y0, x1, y1 = box
+
     if len(points) < 2:
         return
 
-    vals = [p["value"] for p in points]
-    lo, hi = min(vals), max(vals)
-    if hi == lo:
-        hi = lo + 1
+    values = [
+        item["value"]
+        for item in points
+    ]
 
-    # شبکه خیلی ظریف
+    minimum = min(values)
+    maximum = max(values)
+
+    if maximum == minimum:
+        maximum += 1
+
+    # خطوط زمینه
     for i in range(4):
-        y = y0 + (y1-y0) * i / 3
-        draw.line((x0, y, x1, y), fill=(220, 225, 232), width=1)
 
-    pts = []
-    for i, v in enumerate(vals):
-        x = x0 if len(vals) == 1 else x0 + (x1-x0) * i/(len(vals)-1)
-        y = y1 - (v-lo)/(hi-lo) * (y1-y0)
-        pts.append((x, y))
+        y = y0 + (
+            (y1 - y0)
+            * i
+            / 3
+        )
 
-    # fill زیر نمودار
-    poly = [(x0, y1)] + pts + [(x1, y1)]
-    draw.polygon(poly, fill=(245, 170, 170))
-    draw.line(pts, fill=(235, 55, 60), width=line_width, joint="curve")
-    draw.ellipse((pts[-1][0]-5, pts[-1][1]-5, pts[-1][0]+5, pts[-1][1]+5),
-                 fill=(220, 45, 50))
+        draw.line(
+            (x0, y, x1, y),
+            fill=(220, 223, 228),
+            width=1
+        )
+
+    coordinates = []
+
+    for i, value in enumerate(values):
+
+        x = (
+            x0
+            if len(values) == 1
+            else x0
+            + (x1 - x0)
+            * i
+            / (len(values) - 1)
+        )
+
+        y = (
+            y1
+            - (
+                (value - minimum)
+                / (maximum - minimum)
+            )
+            * (y1 - y0)
+        )
+
+        coordinates.append(
+            (x, y)
+        )
+
+    # ناحیه زیر نمودار
+    polygon = [
+        (x0, y1),
+        *coordinates,
+        (x1, y1)
+    ]
+
+    draw.polygon(
+        polygon,
+        fill=(248, 225, 225)
+    )
+
+    draw.line(
+        coordinates,
+        fill=(220, 55, 60),
+        width=4
+    )
+
+    last_x, last_y = coordinates[-1]
+
+    draw.ellipse(
+        (
+            last_x - 5,
+            last_y - 5,
+            last_x + 5,
+            last_y + 5
+        ),
+        fill=(220, 55, 60)
+    )
 
 
-def make_card(title, flag, value, change, history, out_path):
-    W, H = 1000, 430
-    img = Image.new("RGB", (W, H), (246, 247, 249))
-    d = ImageDraw.Draw(img)
+def create_card(
+    title,
+    emoji,
+    value,
+    change,
+    history,
+    filename
+):
 
-    # پس‌زمینه شیشه‌ای/نرم
-    d.rounded_rectangle((35, 25, W-35, H-25), radius=42,
-                        fill=(249, 250, 252), outline=(220, 223, 228), width=2)
+    width = 1000
+    height = 430
+
+    image = Image.new(
+        "RGB",
+        (width, height),
+        (246, 247, 249)
+    )
+
+    draw = ImageDraw.Draw(image)
+
+    # کارت
+    draw.rounded_rectangle(
+        (
+            30,
+            25,
+            width - 30,
+            height - 25
+        ),
+        radius=40,
+        fill=(250, 250, 252),
+        outline=(220, 223, 228),
+        width=2
+    )
 
     # عنوان
-    d.text((690, 55), f"{title} {flag}", font=font(38, True),
-           fill=(32, 35, 42), anchor="ra")
+    draw.text(
+        (900, 60),
+        f"{title} {emoji}",
+        font=get_font(38, True),
+        fill=(35, 38, 45),
+        anchor="ra"
+    )
 
     # واحد
-    d.rounded_rectangle((55, 55, 130, 105), radius=18, fill=(235, 237, 240))
-    d.text((92, 80), "IRT", font=font(23, True),
-           fill=(155, 158, 165), anchor="mm")
+    draw.rounded_rectangle(
+        (65, 55, 145, 105),
+        radius=18,
+        fill=(235, 237, 240)
+    )
+
+    draw.text(
+        (105, 80),
+        "IRT",
+        font=get_font(22, True),
+        fill=(130, 133, 140),
+        anchor="mm"
+    )
 
     # قیمت
-    d.text((690, 150), fmt(value), font=font(86, True),
-           fill=(35, 38, 47), anchor="ra")
-    d.text((710, 145), "تومان", font=font(30, True),
-           fill=(80, 83, 91), anchor="la")
+    draw.text(
+        (720, 165),
+        fmt(value),
+        font=get_font(80, True),
+        fill=(35, 38, 45),
+        anchor="ra"
+    )
 
-    # تغییر
-    up = change >= 0
-    symbol = "▲" if up else "▼"
-    change_text = f"{symbol} {abs(change):.2f}%"
-    pill_fill = (221, 244, 229) if up else (250, 224, 224)
-    pill_text = (33, 145, 75) if up else (210, 75, 75)
-    d.rounded_rectangle((700, 235, 900, 285), radius=22, fill=pill_fill)
-    d.text((800, 260), change_text, font=font(24, True),
-           fill=pill_text, anchor="mm")
+    draw.text(
+        (740, 160),
+        "تومان",
+        font=get_font(28, True),
+        fill=(80, 83, 90),
+        anchor="la"
+    )
+
+    # درصد تغییر
+    positive = change >= 0
+
+    arrow = "▲" if positive else "▼"
+
+    change_text = (
+        f"{arrow} {abs(change):.2f}%"
+    )
+
+    background = (
+        (221, 244, 229)
+        if positive
+        else
+        (250, 224, 224)
+    )
+
+    text_color = (
+        (35, 145, 75)
+        if positive
+        else
+        (210, 75, 75)
+    )
+
+    draw.rounded_rectangle(
+        (700, 230, 900, 285),
+        radius=22,
+        fill=background
+    )
+
+    draw.text(
+        (800, 257),
+        change_text,
+        font=get_font(24, True),
+        fill=text_color,
+        anchor="mm"
+    )
 
     # نمودار
-    chart(d, history, (90, 315, 900, 395), 4)
+    draw_chart(
+        draw,
+        history,
+        (90, 315, 900, 395)
+    )
 
-    img.save(out_path, quality=95)
-
-
-def telegram(method, data=None, files=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    r = requests.post(url, data=data, files=files, timeout=60)
-    r.raise_for_status()
-    payload = r.json()
-    if not payload.get("ok"):
-        raise RuntimeError(payload)
-    return payload["result"]
+    image.save(
+        filename,
+        quality=95
+    )
 
 
-def send_photo(path, caption):
-    with open(path, "rb") as f:
-        return telegram(
+def telegram_request(
+    method,
+    data=None,
+    files=None
+):
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/{method}"
+    )
+
+    response = requests.post(
+        url,
+        data=data,
+        files=files,
+        timeout=60
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    return result["result"]
+
+
+def send_photo(
+    filename,
+    caption
+):
+
+    with open(
+        filename,
+        "rb"
+    ) as photo:
+
+        return telegram_request(
             "sendPhoto",
-            data={"chat_id": CHAT_ID, "caption": caption},
-            files={"photo": f},
+            data={
+                "chat_id": CHAT_ID,
+                "caption": caption,
+            },
+            files={
+                "photo": photo
+            }
         )
 
 
-def pin(message_id):
-    telegram(
+def unpin_all():
+
+    try:
+        telegram_request(
+            "unpinAllChatMessages",
+            data={
+                "chat_id": CHAT_ID
+            }
+        )
+
+    except Exception:
+        pass
+
+
+def pin_message(message_id):
+
+    telegram_request(
         "pinChatMessage",
         data={
             "chat_id": CHAT_ID,
             "message_id": message_id,
-            "disable_notification": "true",
-        },
+            "disable_notification": "true"
+        }
     )
 
 
-def unpin_all():
-    try:
-        telegram("unpinAllChatMessages", data={"chat_id": CHAT_ID})
-    except Exception:
-        # اگر پیام قبلی پین نشده بود، ادامه بده
-        pass
-
-
 def main():
-    now = datetime.now(TEHRAN)
+
+    now = datetime.now(
+        TEHRAN
+    )
+
+    print("Fetching prices...")
+
     usd, gold = fetch_prices()
 
-    h = load_history()
-    stamp = now.isoformat(timespec="seconds")
+    print(
+        f"USD: {usd:,} toman"
+    )
 
-    h["usd"].append({"time": stamp, "value": usd})
-    h["gold18"].append({"time": stamp, "value": gold})
-    h["usd"] = h["usd"][-MAX_POINTS:]
-    h["gold18"] = h["gold18"][-MAX_POINTS:]
-    save_history(h)
+    print(
+        f"Gold 18: {gold:,} toman"
+    )
 
-    usd_change = pct_change(h["usd"])
-    gold_change = pct_change(h["gold18"])
+    history = load_history()
 
-    usd_img = "usd.png"
-    gold_img = "gold18.png"
+    timestamp = now.isoformat(
+        timespec="seconds"
+    )
 
-    make_card("دلار آمریکا", "🇺🇸", usd, usd_change, h["usd"], usd_img)
-    make_card("طلای ۱۸ عیار", "🥇", gold, gold_change, h["gold18"], gold_img)
+    history["usd"].append({
+        "time": timestamp,
+        "value": usd
+    })
 
-    # نمونه پیام با ساختار نزدیک به اسکرین‌شات
-    date_str = now.strftime("%Y/%m/%d")
-    time_str = now.strftime("%H:%M:%S")
+    history["gold18"].append({
+        "time": timestamp,
+        "value": gold
+    })
+
+    history["usd"] = (
+        history["usd"][-MAX_POINTS:]
+    )
+
+    history["gold18"] = (
+        history["gold18"][-MAX_POINTS:]
+    )
+
+    save_history(history)
+
+    usd_change = percent_change(
+        history["usd"]
+    )
+
+    gold_change = percent_change(
+        history["gold18"]
+    )
+
+    create_card(
+        "دلار آمریکا",
+        "🇺🇸",
+        usd,
+        usd_change,
+        history["usd"],
+        "usd.png"
+    )
+
+    create_card(
+        "طلای ۱۸ عیار",
+        "🥇",
+        gold,
+        gold_change,
+        history["gold18"],
+        "gold18.png"
+    )
+
+    date = now.strftime(
+        "%Y/%m/%d"
+    )
+
+    time = now.strftime(
+        "%H:%M:%S"
+    )
 
     usd_caption = (
         f"🇺🇸 1 دلار آمریکا :\n"
-        f"🟢 {fmt(usd)} toman\n"
+        f"🟢 {fmt(usd)} تومان\n"
         f"🟢 1 dollar\n\n"
-        f"🟣 {date_str} | {time_str}"
+        f"🟣 {date} | {time}"
     )
 
     gold_caption = (
         f"🥇 طلای ۱۸ عیار :\n"
-        f"🟢 {fmt(gold)} toman\n"
+        f"🟢 {fmt(gold)} تومان\n"
         f"🟢 1 gram\n\n"
-        f"🟣 {date_str} | {time_str}"
+        f"🟣 {date} | {time}"
     )
+
+    print("Sending messages...")
 
     unpin_all()
 
-    m1 = send_photo(usd_img, usd_caption)
-    pin(m1["message_id"])
+    usd_message = send_photo(
+        "usd.png",
+        usd_caption
+    )
 
-    m2 = send_photo(gold_img, gold_caption)
-    pin(m2["message_id"])
+    pin_message(
+        usd_message["message_id"]
+    )
+
+    gold_message = send_photo(
+        "gold18.png",
+        gold_caption
+    )
+
+    pin_message(
+        gold_message["message_id"]
+    )
+
+    print("DONE!")
 
 
 if __name__ == "__main__":
