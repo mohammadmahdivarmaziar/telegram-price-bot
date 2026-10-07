@@ -2271,7 +2271,7 @@ def main():
                 f"Interval: "
                 f"{format_interval("
                     schedule['interval_minutes']
-                )}"
+                )
             )
 
     except Exception as exc:
