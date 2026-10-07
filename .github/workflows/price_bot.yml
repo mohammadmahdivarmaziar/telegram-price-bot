@@ -1,34 +1,49 @@
 name: Price Bot
+
 permissions:
   contents: write
 
 on:
   schedule:
     - cron: "*/5 * * * *"
+
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+
       - name: Run price bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
-        run: python price_bot.py
+        run: |
+          python price_bot.py
+
       - name: Save bot state
         run: |
           git config user.name "price-bot"
           git config user.email "price-bot@users.noreply.github.com"
-          git add history.json bot_state.json schedule.json telegram_offset.json
+
+          git add history.json
+          git add schedule.json
+          git add telegram_offset.json
+
           git diff --cached --quiet || git commit -m "update bot state [skip ci]"
+
           git push
