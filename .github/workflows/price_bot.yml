@@ -1,72 +1,59 @@
 name: Price Bot
 
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
 permissions:
   contents: write
 
-on:
-  schedule:
-    # GitHub Actions هر 5 دقیقه بیدار می‌شود
-    - cron: "*/5 * * * *"
-
-  # اجرای دستی از Actions
-  workflow_dispatch:
+concurrency:
+  group: price-bot
+  cancel-in-progress: false
 
 jobs:
   run-bot:
-
     runs-on: ubuntu-latest
+    timeout-minutes: 6
 
     steps:
-
-      # -----------------------------
-      # Checkout repository
-      # -----------------------------
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # -----------------------------
-      # Python
-      # -----------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # -----------------------------
-      # Install dependencies
-      # -----------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # -----------------------------
-      # Run bot
-      # -----------------------------
+      - name: Syntax check
+        run: |
+          python -m py_compile price_bot.py
+
       - name: Run price bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           python price_bot.py
 
-      # -----------------------------
-      # Save bot state
-      # -----------------------------
       - name: Save bot state
         run: |
-
           git config user.name "price-bot"
-
-          git config user.email \
-            "price-bot@users.noreply.github.com"
-
-          git add schedule.json
-          git add price_state.json
-          git add telegram_offset.json
-
-          git diff --cached --quiet || \
+          git config user.email "price-bot@users.noreply.github.com"
+          git add schedule.json price_state.json telegram_offset.json
+          if git diff --cached --quiet; then
+            echo "No state changes to commit"
+          else
             git commit -m "update bot state [skip ci]"
-
-          git push
+            git push
+          fi
