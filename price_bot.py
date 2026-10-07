@@ -10,17 +10,17 @@ from bs4 import BeautifulSoup
 
 
 # =========================================================
-# SETTINGS
+# CONFIG
 # =========================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-CHAT_ID = os.environ.get("CHAT_ID", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 
-ADMIN_IDS = {
-    x.strip()
-    for x in os.environ.get("ADMIN_ID", "").split(",")
-    if x.strip()
-}
+ADMIN_IDS = set()
+
+if ADMIN_ID:
+    ADMIN_IDS.add(str(ADMIN_ID))
 
 USD_URL = "https://gem.tgju.org/profile/price_dollar_rl"
 GOLD_URL = "https://gem.tgju.org/profile/geram18"
@@ -29,81 +29,131 @@ SCHEDULE_FILE = "schedule.json"
 STATE_FILE = "price_state.json"
 OFFSET_FILE = "telegram_offset.json"
 
-TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+# Change this whenever the price parser/state logic is changed.
+STATE_VERSION = 2
 
-# هر اجرای GitHub Actions حداقل 60 ثانیه
+# GitHub Actions run should stay alive for about one minute.
 POLL_SECONDS = 60
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/130.0 Safari/537.36"
-    )
-}
+# Reject a scraped price if it suddenly differs by more than 20%.
+# This is primarily a protection against a broken HTML parser.
+PRICE_SANITY_LIMIT = 0.20
+
+# Tehran timezone.
+TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+
+# =========================================================
+# BASIC VALIDATION
+# =========================================================
+
+if not BOT_TOKEN:
+    print("WARNING: BOT_TOKEN is not set.")
+
+if not CHAT_ID:
+    print("WARNING: CHAT_ID is not set.")
+
+if not ADMIN_IDS:
+    print("WARNING: ADMIN_ID is not set.")
 
 
 # =========================================================
 # TELEGRAM API
 # =========================================================
 
-def telegram(method, data=None, timeout=20):
+TELEGRAM_API = (
+    f"https://api.telegram.org/bot{BOT_TOKEN}"
+)
+
+
+def telegram(method, payload=None):
+    """
+    Generic Telegram Bot API request.
+    """
 
     if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN is missing")
+        print("Telegram API unavailable: BOT_TOKEN is missing.")
         return None
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    url = f"{TELEGRAM_API}/{method}"
 
     try:
         response = requests.post(
             url,
-            data=data or {},
-            timeout=timeout
+            json=payload or {},
+            timeout=30
         )
 
-        if not response.ok:
-            print("Telegram HTTP error:")
-            print(response.status_code)
-            print(response.text[:1000])
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data.get("ok"):
+            print(
+                f"Telegram API error in {method}: "
+                f"{data}"
+            )
             return None
 
-        result = response.json()
+        return data.get("result")
 
-        if not result.get("ok"):
-            print("Telegram API error:")
-            print(result)
-            return None
+    except requests.RequestException as exc:
+        print(
+            f"Telegram request failed "
+            f"({method}): {exc}"
+        )
+        return None
 
-        return result.get("result")
-
-    except Exception as e:
-        print("Telegram exception:", e)
+    except Exception as exc:
+        print(
+            f"Telegram unexpected error "
+            f"({method}): {exc}"
+        )
         return None
 
 
-def send_message(text, chat_id=None, reply_markup=None):
+# =========================================================
+# TELEGRAM SEND
+# =========================================================
 
-    target = chat_id or CHAT_ID
+def send_message(chat_id, text):
+    """
+    Send HTML formatted Telegram message.
 
-    data = {
-        "chat_id": target,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+    Returns message_id on success.
+    Returns None on failure.
+    """
 
-    if reply_markup is not None:
-        data["reply_markup"] = json.dumps(
-            reply_markup,
-            ensure_ascii=False
-        )
+    result = telegram(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+    )
 
-    return telegram("sendMessage", data)
+    if not result:
+        return None
 
+    message_id = result.get("message_id")
+
+    if not message_id:
+        print("Telegram sendMessage returned no message_id.")
+        return None
+
+    return message_id
+
+
+# =========================================================
+# TELEGRAM PIN
+# =========================================================
 
 def pin_message(chat_id, message_id):
+    """
+    Pin a Telegram message.
+    """
 
     result = telegram(
         "pinChatMessage",
@@ -115,128 +165,232 @@ def pin_message(chat_id, message_id):
     )
 
     if result is None:
-        print("WARNING: Could not pin message.")
+        print(
+            f"Failed to pin message {message_id}."
+        )
+        return False
 
-    return result
-
-
-def answer_callback(callback_id, text=""):
-
-    return telegram(
-        "answerCallbackQuery",
-        {
-            "callback_query_id": callback_id,
-            "text": text,
-            "show_alert": False,
-        }
+    print(
+        f"Message {message_id} pinned successfully."
     )
+
+    return True
 
 
 # =========================================================
-# JSON
+# JSON HELPERS
 # =========================================================
 
 def load_json(filename, default):
-
     try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return json.load(f)
+        if not os.path.exists(filename):
+            return default
 
-    except Exception:
+        with open(
+            filename,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            return json.load(file)
+
+    except Exception as exc:
+        print(
+            f"Could not load {filename}: {exc}"
+        )
         return default
 
 
 def save_json(filename, data):
+    try:
+        temporary = f"{filename}.tmp"
 
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(
-            data,
-            f,
-            ensure_ascii=False,
-            indent=2
+        with open(
+            temporary,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        os.replace(
+            temporary,
+            filename
         )
 
+        return True
 
-# =========================================================
-# TIME
-# =========================================================
-
-def now_tehran():
-
-    return datetime.now(TEHRAN_TZ)
-
-
-def jalali_date():
-
-    now = now_tehran()
-
-    j = jdatetime.datetime.fromgregorian(
-        datetime=now.replace(tzinfo=None)
-    )
-
-    return j.strftime("%Y/%m/%d")
-
-
-def current_time():
-
-    return now_tehran().strftime("%H:%M:%S")
+    except Exception as exc:
+        print(
+            f"Could not save {filename}: {exc}"
+        )
+        return False
 
 
 # =========================================================
-# SCHEDULE
+# PRICE STATE
 # =========================================================
 
-def load_schedule():
+def load_price_state():
+    """
+    Load previous successfully sent prices.
 
-    default = {
-        "enabled": True,
-        "interval_minutes": 15,
-        "last_sent_at": None
+    If the state belongs to an older parser version,
+    automatically reset it.
+    """
+
+    default_state = {
+        "version": STATE_VERSION,
+        "usd": None,
+        "gold": None,
+        "updated_at": None,
     }
 
+    try:
+        if not os.path.exists(STATE_FILE):
+            return default_state
+
+        data = load_json(
+            STATE_FILE,
+            default_state
+        )
+
+        if not isinstance(data, dict):
+            print(
+                "Invalid price state. "
+                "Creating a new baseline."
+            )
+            return default_state
+
+        if data.get("version") != STATE_VERSION:
+            print(
+                "Old price state detected. "
+                "Resetting price baseline."
+            )
+
+            return default_state
+
+        return {
+            "version": STATE_VERSION,
+            "usd": data.get("usd"),
+            "gold": data.get("gold"),
+            "updated_at": data.get("updated_at"),
+        }
+
+    except Exception as exc:
+        print(
+            f"Error loading price state: {exc}"
+        )
+        return default_state
+
+
+# =========================================================
+# SCHEDULE STATE
+# =========================================================
+
+DEFAULT_SCHEDULE = {
+    "enabled": True,
+    "interval_minutes": 15,
+    "last_sent_at": None,
+}
+
+
+def load_schedule():
     data = load_json(
         SCHEDULE_FILE,
-        default
+        DEFAULT_SCHEDULE
     )
 
     if not isinstance(data, dict):
-        data = default.copy()
+        data = DEFAULT_SCHEDULE.copy()
 
-    data.setdefault("enabled", True)
-    data.setdefault("interval_minutes", 15)
-    data.setdefault("last_sent_at", None)
+    enabled = data.get(
+        "enabled",
+        True
+    )
+
+    interval = data.get(
+        "interval_minutes",
+        15
+    )
+
+    last_sent_at = data.get(
+        "last_sent_at"
+    )
 
     try:
-        data["interval_minutes"] = int(
-            data["interval_minutes"]
-        )
-    except Exception:
-        data["interval_minutes"] = 15
+        interval = int(interval)
+    except (ValueError, TypeError):
+        interval = 15
 
-    if data["interval_minutes"] < 15:
-        data["interval_minutes"] = 15
+    allowed_intervals = {
+        15,
+        30,
+        60,
+        120,
+        240,
+        360,
+        720,
+        1440,
+    }
 
-    if data["interval_minutes"] > 10080:
-        data["interval_minutes"] = 10080
+    if interval not in allowed_intervals:
+        interval = 15
 
-    return data
+    return {
+        "enabled": bool(enabled),
+        "interval_minutes": interval,
+        "last_sent_at": last_sent_at,
+    }
 
 
 def save_schedule(schedule):
-
-    save_json(
+    return save_json(
         SCHEDULE_FILE,
         schedule
     )
 
 
-def parse_datetime(value):
+# =========================================================
+# TIME HELPERS
+# =========================================================
 
+def tehran_now():
+    return datetime.now(TEHRAN_TZ)
+
+
+def jalali_datetime():
+    now = tehran_now()
+
+    return jdatetime.datetime.fromgregorian(
+        datetime=now
+    )
+
+
+def jalali_date_text():
+    jd = jalali_datetime()
+
+    return jd.strftime("%Y/%m/%d")
+
+
+def tehran_time_text():
+    return tehran_now().strftime(
+        "%H:%M:%S"
+    )
+
+
+def iso_now():
+    return tehran_now().isoformat()
+
+
+def parse_iso_datetime(value):
     if not value:
         return None
 
     try:
-
         dt = datetime.fromisoformat(value)
 
         if dt.tzinfo is None:
@@ -250,107 +404,409 @@ def parse_datetime(value):
         return None
 
 
-def automatic_send_due():
-
-    schedule = load_schedule()
-
-    if not schedule.get("enabled", True):
-        return False
-
-    last_sent = parse_datetime(
-        schedule.get("last_sent_at")
-    )
-
-    if last_sent is None:
-        return True
-
-    elapsed = (
-        now_tehran() - last_sent
-    ).total_seconds()
-
-    interval = (
-        int(schedule["interval_minutes"]) * 60
-    )
-
-    return elapsed >= interval
-
-
 # =========================================================
-# PRICE STATE
+# DIGIT NORMALIZATION
 # =========================================================
 
-def load_price_state():
+def normalize_digits(value):
+    """
+    Convert Persian and Arabic digits to ASCII digits.
+    """
 
-    default = {
-        "usd": None,
-        "gold": None,
-        "updated_at": None
-    }
+    if value is None:
+        return ""
 
-    data = load_json(
-        STATE_FILE,
-        default
+    value = str(value)
+
+    translation = str.maketrans(
+        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+        "01234567890123456789"
     )
 
-    if not isinstance(data, dict):
-        return default.copy()
-
-    data.setdefault("usd", None)
-    data.setdefault("gold", None)
-    data.setdefault("updated_at", None)
-
-    return data
+    return value.translate(translation)
 
 
-def save_price_state(state):
+def parse_number(value):
+    """
+    Convert a formatted number into integer.
 
-    save_json(
-        STATE_FILE,
-        state
-    )
+    Handles:
 
-
-# =========================================================
-# PRICE
-# =========================================================
-
-def clean_number(value):
+    2,688,200
+    ۲,۶۸۸,۲۰۰
+    2٬688٬200
+    ۲۶۲٬۴۲۹٬۰۰۰
+    """
 
     if value is None:
         return None
 
-    value = str(value)
+    value = normalize_digits(value)
 
     value = (
         value
         .replace(",", "")
         .replace("٬", "")
         .replace(" ", "")
-        .replace("ریال", "")
-        .replace("تومان", "")
+        .replace("\u200c", "")
+        .strip()
     )
 
-    value = value.translate(
-        str.maketrans(
-            "۰۱۲۳۴۵۶۷۸۹",
-            "0123456789"
-        )
+    match = re.search(
+        r"\d+",
+        value
     )
+
+    if not match:
+        return None
 
     try:
-        return float(value)
-
-    except Exception:
+        return int(match.group())
+    except (ValueError, TypeError):
         return None
 
 
-def market_price(url):
+# =========================================================
+# PRICE RANGE VALIDATION
+# =========================================================
+
+def is_valid_rial_price(value, kind):
+    """
+    Validate a candidate TGJU value.
+
+    These ranges are intentionally broad.
+    They are only intended to eliminate timestamps,
+    IDs and unrelated statistics.
+    """
+
+    if value is None:
+        return False
+
+    if kind == "usd":
+        # USD free-market price in Rial.
+        return (
+            500_000
+            <= value
+            <= 20_000_000
+        )
+
+    if kind == "gold":
+        # 18K gold price in Rial.
+        return (
+            50_000_000
+            <= value
+            <= 2_000_000_000
+        )
+
+    return False
+
+
+# =========================================================
+# TGJU PRICE EXTRACTION
+# =========================================================
+
+def extract_current_rate(
+    html,
+    visible_text,
+    kind
+):
+    """
+    Extract the CURRENT TGJU price.
+
+    Priority:
+
+    1. "نرخ فعلی"
+    2. Specific DOM price elements
+    3. Context around "قیمت"
+    4. Other safe fallbacks
+
+    We intentionally DO NOT use TGJU daily percentage.
+    """
+
+    # -----------------------------------------------------
+    # 1. Strongest match:
+    #    نرخ فعلی:: 2,688,200
+    # -----------------------------------------------------
+
+    sources = []
+
+    if visible_text:
+        sources.append(
+            normalize_digits(
+                visible_text
+            )
+        )
+
+    if html:
+        sources.append(
+            normalize_digits(
+                html
+            )
+        )
+
+    current_patterns = [
+        r"نرخ\s*فعلی\s*[:：]+\s*"
+        r"([0-9][0-9,٬\s]{4,})",
+
+        r"نرخ\s*فعلی\s*[:：]?\s*"
+        r"([0-9][0-9,٬\s]{4,})",
+    ]
+
+    for source in sources:
+
+        if not source:
+            continue
+
+        for pattern in current_patterns:
+
+            match = re.search(
+                pattern,
+                source,
+                flags=re.IGNORECASE
+            )
+
+            if not match:
+                continue
+
+            number = parse_number(
+                match.group(1)
+            )
+
+            if (
+                number is not None
+                and is_valid_rial_price(
+                    number,
+                    kind
+                )
+            ):
+                print(
+                    f"{kind}: current rate found "
+                    f"using 'نرخ فعلی': "
+                    f"{number:,} Rial"
+                )
+
+                return number
+
+    # -----------------------------------------------------
+    # 2. DOM selectors
+    # -----------------------------------------------------
 
     try:
 
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
+        )
+
+        selectors = [
+            '[data-field="price"]',
+            '[data-field="current"]',
+            '[data-field="last"]',
+            '.price',
+            '.price-value',
+            '.current-price',
+            '.profile-price',
+            '.info .value',
+            '.price-box .value',
+            '[class*="price"]',
+        ]
+
+        for selector in selectors:
+
+            try:
+                elements = soup.select(
+                    selector
+                )
+            except Exception:
+                continue
+
+            for element in elements:
+
+                text_value = element.get_text(
+                    " ",
+                    strip=True
+                )
+
+                if not text_value:
+                    continue
+
+                candidates = re.findall(
+                    r"[0-9][0-9,٬\s]{4,}",
+                    normalize_digits(
+                        text_value
+                    )
+                )
+
+                for candidate in candidates:
+
+                    number = parse_number(
+                        candidate
+                    )
+
+                    if (
+                        number is not None
+                        and is_valid_rial_price(
+                            number,
+                            kind
+                        )
+                    ):
+                        print(
+                            f"{kind}: current rate found "
+                            f"from DOM selector "
+                            f"{selector}: "
+                            f"{number:,} Rial"
+                        )
+
+                        return number
+
+    except Exception as exc:
+
+        print(
+            f"DOM parser warning for "
+            f"{kind}: {exc}"
+        )
+
+    # -----------------------------------------------------
+    # 3. Contextual fallback
+    # -----------------------------------------------------
+
+    text = normalize_digits(
+        visible_text or ""
+    )
+
+    contextual_patterns = [
+
+        r"در\s+حال\s+حاضر.*?"
+        r"([0-9][0-9,٬\s]{5,})"
+        r"\s*ریال",
+
+        r"قیمت.*?"
+        r"([0-9][0-9,٬\s]{5,})"
+        r"\s*ریال",
+    ]
+
+    for pattern in contextual_patterns:
+
+        matches = re.findall(
+            pattern,
+            text,
+            flags=re.DOTALL
+        )
+
+        for candidate in matches:
+
+            number = parse_number(
+                candidate
+            )
+
+            if (
+                number is not None
+                and is_valid_rial_price(
+                    number,
+                    kind
+                )
+            ):
+                print(
+                    f"{kind}: current rate found "
+                    f"using contextual fallback: "
+                    f"{number:,} Rial"
+                )
+
+                return number
+
+    # -----------------------------------------------------
+    # 4. Embedded JSON fallback
+    # -----------------------------------------------------
+
+    json_patterns = [
+
+        r'"price"\s*:\s*"'
+        r"([0-9][0-9,٬]*)",
+
+        r'"price"\s*:\s*'
+        r"([0-9][0-9,٬]*)",
+
+        r'"current"\s*:\s*"'
+        r"([0-9][0-9,٬]*)",
+
+        r'"current"\s*:\s*'
+        r"([0-9][0-9,٬]*)",
+    ]
+
+    for source in sources:
+
+        for pattern in json_patterns:
+
+            matches = re.findall(
+                pattern,
+                source
+            )
+
+            for candidate in matches:
+
+                number = parse_number(
+                    candidate
+                )
+
+                if (
+                    number is not None
+                    and is_valid_rial_price(
+                        number,
+                        kind
+                    )
+                ):
+                    print(
+                        f"{kind}: current rate found "
+                        f"from embedded data: "
+                        f"{number:,} Rial"
+                    )
+
+                    return number
+
+    print(
+        f"ERROR: no reliable current "
+        f"{kind} rate found."
+    )
+
+    return None
+
+
+# =========================================================
+# FETCH MARKET PRICE
+# =========================================================
+
+def market_price(url, kind):
+    """
+    Fetch TGJU current price and return Toman.
+    """
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/131.0 Safari/537.36"
+        ),
+        "Accept-Language": (
+            "fa-IR,fa;q=0.9,en;q=0.8"
+        ),
+        "Accept": (
+            "text/html,"
+            "application/xhtml+xml,"
+            "application/xml;q=0.9,"
+            "*/*;q=0.8"
+        ),
+    }
+
+    try:
+
+        print(
+            f"Fetching {kind} from TGJU..."
+        )
+
         response = requests.get(
             url,
-            headers=HEADERS,
+            headers=headers,
             timeout=20
         )
 
@@ -363,146 +819,231 @@ def market_price(url):
             "html.parser"
         )
 
-        text = soup.get_text(
+        visible_text = soup.get_text(
             " ",
             strip=True
         )
 
-        current = None
+        rial_price = extract_current_rate(
+            html,
+            visible_text,
+            kind
+        )
 
-        patterns = [
-            r'"price"\s*:\s*"?(?:([\d,]+))',
-            r'"current"\s*:\s*"?(?:([\d,]+))',
-            r'"value"\s*:\s*"?(?:([\d,]+))',
-            r'قیمت[^0-9]{0,100}([\d,]{6,})',
-        ]
-
-        for pattern in patterns:
-
-            match = re.search(
-                pattern,
-                html,
-                re.IGNORECASE
-            )
-
-            if match:
-
-                current = clean_number(
-                    match.group(1)
-                )
-
-                if current:
-                    break
-
-        if current is None:
-
-            numbers = re.findall(
-                r"(?<!\d)(\d{6,12})(?!\d)",
-                text
-            )
-
-            candidates = []
-
-            for number in numbers:
-
-                try:
-
-                    value = int(number)
-
-                    if value >= 100000:
-                        candidates.append(value)
-
-                except Exception:
-                    pass
-
-            if candidates:
-                current = float(
-                    candidates[0]
-                )
-
-        if current is None:
+        if rial_price is None:
 
             print(
-                "PRICE NOT FOUND:",
-                url
+                f"ERROR: Could not extract "
+                f"valid {kind} price."
             )
 
             return None
 
-        # TGJU = Rial
-        # Bot = Toman
-        return current / 10
-
-    except Exception as e:
+        # TGJU profile value is Rial.
+        # Telegram message is Toman.
+        toman_price = rial_price // 10
 
         print(
-            "market_price error:",
-            e
+            f"{kind.upper()} | "
+            f"Rial: {rial_price:,} | "
+            f"Toman: {toman_price:,}"
+        )
+
+        return toman_price
+
+    except requests.RequestException as exc:
+
+        print(
+            f"ERROR fetching {kind}: {exc}"
+        )
+
+        return None
+
+    except Exception as exc:
+
+        print(
+            f"ERROR parsing {kind}: {exc}"
         )
 
         return None
 
 
 # =========================================================
-# PERCENTAGE
+# PERCENTAGE CALCULATION
 # =========================================================
 
-def calculate_change(previous, current):
+def calculate_change(
+    previous,
+    current
+):
+    """
+    Calculate percentage change based ONLY on
+    previous successful bot price.
 
-    if previous is None:
+    Formula:
+
+    ((current - previous) / previous) * 100
+    """
+
+    if (
+        previous is None
+        or current is None
+    ):
         return None
 
-    if current is None:
+    try:
+
+        previous = int(previous)
+        current = int(current)
+
+        if previous <= 0:
+            return None
+
+        change = (
+            (current - previous)
+            / previous
+        ) * 100
+
+        # Prevent -0.00
+        if abs(change) < 0.0005:
+            change = 0.0
+
+        return change
+
+    except (
+        ValueError,
+        TypeError,
+        ZeroDivisionError
+    ):
         return None
-
-    if previous == 0:
-        return None
-
-    return (
-        (current - previous)
-        / previous
-    ) * 100
-
-
-def format_change(change):
-
-    if change is None:
-        return "⚪ جدید"
-
-    if change > 0:
-        return f"🟢+{change:.2f}%"
-
-    if change < 0:
-        return f"🔴{change:.2f}%"
-
-    return "⚪0.00%"
 
 
 # =========================================================
-# MESSAGE
+# PRICE SANITY CHECK
+# =========================================================
+
+def is_suspicious_change(
+    previous,
+    current
+):
+    """
+    Detect likely parser errors.
+
+    If the parser suddenly returns a price more than
+    20% away from the previous successful bot price,
+    reject it instead of corrupting state.
+    """
+
+    if (
+        previous is None
+        or current is None
+    ):
+        return False
+
+    try:
+
+        previous = int(previous)
+        current = int(current)
+
+        if previous <= 0:
+            return True
+
+        ratio = (
+            abs(current - previous)
+            / previous
+        )
+
+        if ratio > PRICE_SANITY_LIMIT:
+
+            print(
+                "WARNING: suspicious price jump:"
+            )
+
+            print(
+                f"Previous: {previous:,}"
+            )
+
+            print(
+                f"Current : {current:,}"
+            )
+
+            print(
+                f"Change  : {ratio * 100:.2f}%"
+            )
+
+            return True
+
+        return False
+
+    except (
+        ValueError,
+        TypeError,
+        ZeroDivisionError
+    ):
+
+        return True
+
+
+# =========================================================
+# MESSAGE FORMAT
 # =========================================================
 
 def make_price_message(
     title,
-    emoji,
     price,
-    change
+    change,
+    asset=None
 ):
+    """
+    Build Telegram HTML message.
+    """
 
-    if change is not None and change < 0:
+    now = tehran_now()
 
-        direction = "⬇️"
+    jalali = jdatetime.datetime.fromgregorian(
+        datetime=now
+    )
+
+    date_text = jalali.strftime(
+        "%Y/%m/%d"
+    )
+
+    time_text = now.strftime(
+        "%H:%M:%S"
+    )
+
+    price_text = f"{int(price):,}"
+
+    # -----------------------------------------------------
+    # First baseline
+    # -----------------------------------------------------
+
+    if change is None:
+
+        direction = "➡️"
+
+        change_text = (
+            "⚪ جدید"
+        )
 
         phrase = (
-            "🟢 "
+            "⚪ "
             "<tg-spoiler>"
-            "فکر کنم رفتن"
+            "قیمت مرجع ثبت شد"
             "</tg-spoiler>"
         )
 
-    else:
+    # -----------------------------------------------------
+    # Increase
+    # -----------------------------------------------------
+
+    elif change > 0:
 
         direction = "⬆️"
+
+        change_text = (
+            f"🟢+{change:.2f}%"
+        )
 
         phrase = (
             "🔴 "
@@ -511,160 +1052,354 @@ def make_price_message(
             "</tg-spoiler>"
         )
 
-    return (
-        f"{direction} {title} {emoji}\n\n"
-        f"💰 <b>{int(round(price)):,} تومان</b>\n"
+    # -----------------------------------------------------
+    # Decrease
+    # -----------------------------------------------------
+
+    elif change < 0:
+
+        direction = "⬇️"
+
+        change_text = (
+            f"🔴{change:.2f}%"
+        )
+
+        phrase = (
+            "🟢 "
+            "<tg-spoiler>"
+            "فکر کنم رفتن"
+            "</tg-spoiler>"
+        )
+
+    # -----------------------------------------------------
+    # No change
+    # -----------------------------------------------------
+
+    else:
+
+        direction = "➡️"
+
+        change_text = (
+            "⚪0.00%"
+        )
+
+        phrase = (
+            "⚪ "
+            "<tg-spoiler>"
+            "بدون تغییر"
+            "</tg-spoiler>"
+        )
+
+    message = (
+        f"{direction} "
+        f"<b>{title}</b>\n\n"
+        f"💰 {price_text} تومان\n"
         f"📊 تغییر نسبت به پیام قبلی: "
-        f"<b>{format_change(change)}</b>\n"
+        f"{change_text}\n"
         f"{phrase}\n\n"
-        f"🕐 {jalali_date()} | {current_time()}"
+        f"🕐 {date_text} | {time_text}"
     )
+
+    return message
 
 
 # =========================================================
-# SEND + PIN
+# SEND PRICES
 # =========================================================
 
 def send_prices():
-
-    print("=" * 60)
-    print("GETTING PRICES")
-    print("=" * 60)
-
-    usd = market_price(USD_URL)
-    gold = market_price(GOLD_URL)
-
-    if usd is None:
-        print("USD price failed.")
-
-    if gold is None:
-        print("Gold price failed.")
-
-    if usd is None and gold is None:
-        print("ERROR: Both prices failed.")
-        return False
+    """
+    Fetch USD + Gold, calculate changes based on
+    previous successfully sent prices, send messages,
+    pin them, and update state only after success.
+    """
 
     state = load_price_state()
 
-    previous_usd = state.get("usd")
-    previous_gold = state.get("gold")
-
-    usd_change = calculate_change(
-        previous_usd,
-        usd
+    previous_usd = state.get(
+        "usd"
     )
 
-    gold_change = calculate_change(
-        previous_gold,
-        gold
+    previous_gold = state.get(
+        "gold"
+    )
+
+    print("")
+    print("=" * 60)
+    print("STARTING PRICE UPDATE")
+    print("=" * 60)
+
+    print(
+        f"Previous USD : "
+        f"{previous_usd:,}"
+        if previous_usd is not None
+        else "Previous USD : NONE"
+    )
+
+    print(
+        f"Previous Gold: "
+        f"{previous_gold:,}"
+        if previous_gold is not None
+        else "Previous Gold: NONE"
+    )
+
+    # -----------------------------------------------------
+    # Fetch
+    # -----------------------------------------------------
+
+    current_usd = market_price(
+        USD_URL,
+        "usd"
+    )
+
+    current_gold = market_price(
+        GOLD_URL,
+        "gold"
     )
 
     sent_any = False
 
-    # -------------------------
+    # -----------------------------------------------------
     # USD
-    # -------------------------
+    # -----------------------------------------------------
 
-    if usd is not None:
+    if current_usd is not None:
 
-        message = make_price_message(
-            "دلار آزاد",
-            "💵",
-            usd,
-            usd_change
-        )
+        if is_suspicious_change(
+            previous_usd,
+            current_usd
+        ):
 
-        result = send_message(message)
+            print(
+                "USD rejected because "
+                "the price jump looks suspicious."
+            )
 
-        if result:
+        else:
 
-            sent_any = True
-
-            message_id = result.get(
-                "message_id"
+            usd_change = calculate_change(
+                previous_usd,
+                current_usd
             )
 
             print(
-                "USD message sent:",
-                message_id
+                "USD change: "
+                f"{usd_change:.4f}%"
+                if usd_change is not None
+                else "USD change: NEW"
+            )
+
+            usd_message = make_price_message(
+                title="دلار آزاد 💵",
+                price=current_usd,
+                change=usd_change,
+                asset="usd"
+            )
+
+            message_id = send_message(
+                CHAT_ID,
+                usd_message
             )
 
             if message_id:
+
+                print(
+                    f"USD message sent: "
+                    f"{message_id}"
+                )
 
                 pin_message(
                     CHAT_ID,
                     message_id
                 )
 
-    # -------------------------
+                # Only now update USD state.
+                state["usd"] = current_usd
+
+                sent_any = True
+
+            else:
+
+                print(
+                    "USD message failed."
+                )
+
+                print(
+                    "Previous USD state preserved."
+                )
+
+    else:
+
+        print(
+            "USD price unavailable."
+        )
+
+        print(
+            "USD state preserved."
+        )
+
+    # -----------------------------------------------------
     # GOLD
-    # -------------------------
+    # -----------------------------------------------------
 
-    if gold is not None:
+    if current_gold is not None:
 
-        message = make_price_message(
-            "طلای ۱۸ عیار",
-            "🪙",
-            gold,
-            gold_change
-        )
+        if is_suspicious_change(
+            previous_gold,
+            current_gold
+        ):
 
-        result = send_message(message)
+            print(
+                "Gold rejected because "
+                "the price jump looks suspicious."
+            )
 
-        if result:
+        else:
 
-            sent_any = True
-
-            message_id = result.get(
-                "message_id"
+            gold_change = calculate_change(
+                previous_gold,
+                current_gold
             )
 
             print(
-                "Gold message sent:",
-                message_id
+                "Gold change: "
+                f"{gold_change:.4f}%"
+                if gold_change is not None
+                else "Gold change: NEW"
+            )
+
+            gold_message = make_price_message(
+                title="طلای ۱۸ عیار 🪙",
+                price=current_gold,
+                change=gold_change,
+                asset="gold"
+            )
+
+            message_id = send_message(
+                CHAT_ID,
+                gold_message
             )
 
             if message_id:
+
+                print(
+                    f"Gold message sent: "
+                    f"{message_id}"
+                )
 
                 pin_message(
                     CHAT_ID,
                     message_id
                 )
 
-    # -------------------------
-    # SAVE STATE
-    # -------------------------
+                # Only now update Gold state.
+                state["gold"] = current_gold
+
+                sent_any = True
+
+            else:
+
+                print(
+                    "Gold message failed."
+                )
+
+                print(
+                    "Previous Gold state preserved."
+                )
+
+    else:
+
+        print(
+            "Gold price unavailable."
+        )
+
+        print(
+            "Gold state preserved."
+        )
+
+    # -----------------------------------------------------
+    # Save state
+    # -----------------------------------------------------
 
     if sent_any:
 
-        save_price_state(
-            {
-                "usd": usd,
-                "gold": gold,
-                "updated_at":
-                    now_tehran().isoformat()
-            }
+        state["version"] = STATE_VERSION
+
+        state["updated_at"] = iso_now()
+
+        save_json(
+            STATE_FILE,
+            state
         )
-
-        schedule = load_schedule()
-
-        schedule["last_sent_at"] = (
-            now_tehran().isoformat()
-        )
-
-        save_schedule(schedule)
 
         print(
-            "PRICE STATE SAVED"
+            "Price state saved."
         )
 
-        return True
+    else:
 
-    print(
-        "ERROR: Nothing was sent."
+        print(
+            "No successful price message."
+        )
+
+        print(
+            "Price state NOT changed."
+        )
+
+    print("=" * 60)
+    print("PRICE UPDATE FINISHED")
+    print("=" * 60)
+    print("")
+
+    return sent_any
+
+
+# =========================================================
+# SCHEDULE
+# =========================================================
+
+def automatic_send_due():
+    """
+    Determine whether automatic price sending is due.
+    """
+
+    schedule = load_schedule()
+
+    if not schedule["enabled"]:
+        return False
+
+    last_sent_at = parse_iso_datetime(
+        schedule.get("last_sent_at")
     )
 
-    return False
+    if last_sent_at is None:
+        return True
+
+    now = tehran_now()
+
+    elapsed_seconds = (
+        now - last_sent_at
+    ).total_seconds()
+
+    interval_seconds = (
+        schedule["interval_minutes"]
+        * 60
+    )
+
+    return (
+        elapsed_seconds
+        >= interval_seconds
+    )
+
+
+def mark_automatic_send():
+    schedule = load_schedule()
+
+    schedule["last_sent_at"] = iso_now()
+
+    save_schedule(
+        schedule
+    )
 
 
 # =========================================================
@@ -672,379 +1407,288 @@ def send_prices():
 # =========================================================
 
 def admin_keyboard():
-
     return {
         "inline_keyboard": [
-
             [
                 {
-                    "text": "⏱ تغییر زمان",
-                    "callback_data": "set_time"
-                },
-                {
-                    "text": "▶️ ارسال فوری",
+                    "text": "📤 ارسال فوری",
                     "callback_data": "send_now"
                 }
             ],
-
             [
+                {
+                    "text": "▶️ فعال کردن",
+                    "callback_data": "resume"
+                },
                 {
                     "text": "⏸ توقف",
                     "callback_data": "pause"
-                },
-                {
-                    "text": "▶️ فعال‌سازی",
-                    "callback_data": "resume"
                 }
             ],
-
+            [
+                {
+                    "text": "⏱ تنظیم زمان",
+                    "callback_data": "interval"
+                }
+            ],
             [
                 {
                     "text": "📊 وضعیت",
                     "callback_data": "status"
                 }
             ]
-
         ]
     }
 
 
-def time_keyboard():
-
+def interval_keyboard():
     return {
         "inline_keyboard": [
-
             [
                 {
-                    "text": "۱۵ دقیقه",
-                    "callback_data": "time_15"
+                    "text": "15 دقیقه",
+                    "callback_data": "interval_15"
                 },
                 {
-                    "text": "۳۰ دقیقه",
-                    "callback_data": "time_30"
+                    "text": "30 دقیقه",
+                    "callback_data": "interval_30"
                 }
             ],
-
             [
                 {
-                    "text": "۱ ساعت",
-                    "callback_data": "time_60"
+                    "text": "1 ساعت",
+                    "callback_data": "interval_60"
                 },
                 {
-                    "text": "۲ ساعت",
-                    "callback_data": "time_120"
+                    "text": "2 ساعت",
+                    "callback_data": "interval_120"
                 }
             ],
-
             [
                 {
-                    "text": "۴ ساعت",
-                    "callback_data": "time_240"
+                    "text": "4 ساعت",
+                    "callback_data": "interval_240"
                 },
                 {
-                    "text": "۶ ساعت",
-                    "callback_data": "time_360"
+                    "text": "6 ساعت",
+                    "callback_data": "interval_360"
                 }
             ],
-
             [
                 {
-                    "text": "۱۲ ساعت",
-                    "callback_data": "time_720"
+                    "text": "12 ساعت",
+                    "callback_data": "interval_720"
                 },
                 {
-                    "text": "۲۴ ساعت",
-                    "callback_data": "time_1440"
+                    "text": "24 ساعت",
+                    "callback_data": "interval_1440"
+                }
+            ],
+            [
+                {
+                    "text": "⬅️ بازگشت",
+                    "callback_data": "admin_back"
                 }
             ]
-
         ]
     }
 
 
-def is_admin(user_id):
+# =========================================================
+# ADMIN PANEL
+# =========================================================
 
-    return str(user_id) in ADMIN_IDS
-
-
-def interval_label(minutes):
-
-    minutes = int(minutes)
-
-    if minutes < 60:
-        return f"{minutes} دقیقه"
-
-    if minutes % 60 == 0:
-        return f"{minutes // 60} ساعت"
-
-    return f"{minutes} دقیقه"
-
-
-def show_admin_panel(chat_id):
-
+def admin_panel_text():
     schedule = load_schedule()
 
-    enabled = (
-        "فعال ✅"
+    status = (
+        "🟢 فعال"
         if schedule["enabled"]
-        else "متوقف ⏸"
+        else "🔴 متوقف"
     )
 
-    text = (
-        "🛠 <b>پنل مدیریت ربات</b>\n\n"
-        f"وضعیت: <b>{enabled}</b>\n"
-        f"فاصله ارسال: "
-        f"<b>{interval_label(schedule['interval_minutes'])}</b>\n\n"
-        "از دکمه‌های زیر استفاده کن:"
+    interval = schedule[
+        "interval_minutes"
+    ]
+
+    last_sent = (
+        schedule.get("last_sent_at")
+        or "هنوز ارسال نشده"
     )
 
-    send_message(
-        text,
-        chat_id=chat_id,
-        reply_markup=admin_keyboard()
+    return (
+        "⚙️ <b>پنل مدیریت ربات</b>\n\n"
+        f"وضعیت: {status}\n"
+        f"⏱ فاصله ارسال: "
+        f"{format_interval(interval)}\n"
+        f"🕐 آخرین ارسال: {last_sent}\n\n"
+        "یکی از گزینه‌ها را انتخاب کنید:"
     )
 
 
-def show_status(chat_id):
+def format_interval(minutes):
+    mapping = {
+        15: "15 دقیقه",
+        30: "30 دقیقه",
+        60: "1 ساعت",
+        120: "2 ساعت",
+        240: "4 ساعت",
+        360: "6 ساعت",
+        720: "12 ساعت",
+        1440: "24 ساعت",
+    }
 
+    return mapping.get(
+        minutes,
+        f"{minutes} دقیقه"
+    )
+
+
+def send_admin_panel(chat_id):
+    return telegram(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": admin_panel_text(),
+            "parse_mode": "HTML",
+            "reply_markup": admin_keyboard(),
+        }
+    )
+
+
+# =========================================================
+# STATUS
+# =========================================================
+
+def status_text():
     schedule = load_schedule()
     state = load_price_state()
 
     enabled = (
-        "فعال ✅"
+        "🟢 فعال"
         if schedule["enabled"]
-        else "متوقف ⏸"
+        else "🔴 متوقف"
     )
 
-    last = schedule.get(
-        "last_sent_at"
+    interval = format_interval(
+        schedule["interval_minutes"]
     )
 
-    if last:
-
-        dt = parse_datetime(last)
-
-        if dt:
-
-            last_text = dt.strftime(
-                "%Y/%m/%d %H:%M:%S"
-            )
-
-        else:
-            last_text = str(last)
-
-    else:
-
-        last_text = "هنوز ارسال نشده"
+    last_sent = (
+        schedule.get("last_sent_at")
+        or "هنوز ارسال نشده"
+    )
 
     usd = state.get("usd")
     gold = state.get("gold")
 
     usd_text = (
-        f"{int(round(usd)):,}"
+        f"{int(usd):,} تومان"
         if usd is not None
-        else "ندارد"
+        else "ثبت نشده"
     )
 
     gold_text = (
-        f"{int(round(gold)):,}"
+        f"{int(gold):,} تومان"
         if gold is not None
-        else "ندارد"
+        else "ثبت نشده"
     )
 
-    text = (
+    return (
         "📊 <b>وضعیت ربات</b>\n\n"
-        f"وضعیت: <b>{enabled}</b>\n"
-        f"فاصله ارسال: "
-        f"<b>{interval_label(schedule['interval_minutes'])}</b>\n"
-        f"آخرین ارسال: <b>{last_text}</b>\n\n"
-        f"قیمت قبلی دلار: "
-        f"<b>{usd_text}</b>\n"
-        f"قیمت قبلی طلا: "
-        f"<b>{gold_text}</b>"
-    )
-
-    send_message(
-        text,
-        chat_id=chat_id
-    )
-
-
-def set_interval(minutes, chat_id):
-
-    try:
-        minutes = int(minutes)
-
-    except Exception:
-
-        send_message(
-            "❌ عدد نامعتبر است.",
-            chat_id=chat_id
-        )
-
-        return
-
-    if minutes < 15:
-        minutes = 15
-
-    if minutes > 10080:
-        minutes = 10080
-
-    schedule = load_schedule()
-
-    schedule["interval_minutes"] = minutes
-    schedule["enabled"] = True
-
-    save_schedule(schedule)
-
-    send_message(
-        "✅ فاصله ارسال روی "
-        f"<b>{interval_label(minutes)}</b> "
-        "تنظیم شد.",
-        chat_id=chat_id
+        f"وضعیت ارسال خودکار: {enabled}\n"
+        f"⏱ فاصله: {interval}\n"
+        f"🕐 آخرین ارسال: {last_sent}\n\n"
+        f"💵 آخرین دلار: {usd_text}\n"
+        f"🪙 آخرین طلای ۱۸: {gold_text}"
     )
 
 
 # =========================================================
-# COMMANDS
+# CALLBACK ANSWER
 # =========================================================
 
-def handle_message(message):
-
-    chat = message.get("chat", {})
-    user = message.get("from", {})
-
-    chat_id = chat.get("id")
-    user_id = user.get("id")
-
-    if not chat_id or not user_id:
-        return
-
-    if not is_admin(user_id):
-
-        print(
-            "Unauthorized user:",
-            user_id
-        )
-
-        return
-
-    text = (
-        message.get("text") or ""
-    ).strip()
-
-    if not text:
-        return
-
-    command = (
-        text
-        .split()[0]
-        .lower()
-        .split("@")[0]
+def answer_callback(callback_id, text):
+    telegram(
+        "answerCallbackQuery",
+        {
+            "callback_query_id": callback_id,
+            "text": text,
+            "show_alert": False,
+        }
     )
 
-    if command == "/admin":
 
-        show_admin_panel(chat_id)
-        return
+# =========================================================
+# EDIT ADMIN MESSAGE
+# =========================================================
 
-    if command == "/status":
+def edit_message(
+    chat_id,
+    message_id,
+    text,
+    reply_markup=None
+):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
 
-        show_status(chat_id)
-        return
+    if reply_markup is not None:
+        payload[
+            "reply_markup"
+        ] = reply_markup
 
-    if command == "/send":
-
-        ok = send_prices()
-
-        send_message(
-            "✅ ارسال انجام شد."
-            if ok
-            else
-            "❌ ارسال ناموفق بود.",
-            chat_id=chat_id
-        )
-
-        return
-
-    if command == "/pause":
-
-        schedule = load_schedule()
-
-        schedule["enabled"] = False
-
-        save_schedule(schedule)
-
-        send_message(
-            "⏸ ارسال خودکار متوقف شد.",
-            chat_id=chat_id
-        )
-
-        return
-
-    if command == "/resume":
-
-        schedule = load_schedule()
-
-        schedule["enabled"] = True
-
-        save_schedule(schedule)
-
-        send_message(
-            "▶️ ارسال خودکار فعال شد.",
-            chat_id=chat_id
-        )
-
-        return
-
-    if command == "/settime":
-
-        parts = text.split()
-
-        if len(parts) != 2:
-
-            send_message(
-                "مثال:\n"
-                "<code>/settime 15</code>\n\n"
-                "عدد بر حسب دقیقه است.",
-                chat_id=chat_id
-            )
-
-            return
-
-        try:
-
-            minutes = int(parts[1])
-
-        except Exception:
-
-            send_message(
-                "❌ عدد صحیح نیست.",
-                chat_id=chat_id
-            )
-
-            return
-
-        set_interval(
-            minutes,
-            chat_id
-        )
+    return telegram(
+        "editMessageText",
+        payload
+    )
 
 
 # =========================================================
-# CALLBACKS
+# ADMIN AUTHORIZATION
+# =========================================================
+
+def is_admin(user_id):
+    if user_id is None:
+        return False
+
+    return str(user_id) in ADMIN_IDS
+
+
+# =========================================================
+# HANDLE CALLBACK
 # =========================================================
 
 def handle_callback(callback):
+    callback_id = callback.get(
+        "id"
+    )
 
-    callback_id = callback.get("id")
+    data = callback.get(
+        "data",
+        ""
+    )
 
-    user = callback.get(
+    from_user = callback.get(
         "from",
         {}
     )
 
-    user_id = user.get("id")
+    user_id = from_user.get(
+        "id"
+    )
+
+    if not is_admin(user_id):
+
+        answer_callback(
+            callback_id,
+            "⛔ دسترسی ندارید."
+        )
+
+        return
 
     message = callback.get(
         "message",
@@ -1056,123 +1700,326 @@ def handle_callback(callback):
         {}
     )
 
-    chat_id = chat.get("id")
+    chat_id = chat.get(
+        "id"
+    )
 
-    if not is_admin(user_id):
+    message_id = message.get(
+        "message_id"
+    )
+
+    # -----------------------------------------------------
+    # Send now
+    # -----------------------------------------------------
+
+    if data == "send_now":
 
         answer_callback(
             callback_id,
-            "⛔ دسترسی ندارید."
+            "در حال دریافت قیمت..."
+        )
+
+        success = send_prices()
+
+        schedule = load_schedule()
+
+        if success:
+            schedule[
+                "last_sent_at"
+            ] = iso_now()
+
+            save_schedule(
+                schedule
+            )
+
+        edit_message(
+            chat_id,
+            message_id,
+            admin_panel_text(),
+            admin_keyboard()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # Pause
+    # -----------------------------------------------------
+
+    if data == "pause":
+
+        schedule = load_schedule()
+
+        schedule[
+            "enabled"
+        ] = False
+
+        save_schedule(
+            schedule
+        )
+
+        answer_callback(
+            callback_id,
+            "⏸ ارسال خودکار متوقف شد."
+        )
+
+        edit_message(
+            chat_id,
+            message_id,
+            admin_panel_text(),
+            admin_keyboard()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # Resume
+    # -----------------------------------------------------
+
+    if data == "resume":
+
+        schedule = load_schedule()
+
+        schedule[
+            "enabled"
+        ] = True
+
+        save_schedule(
+            schedule
+        )
+
+        answer_callback(
+            callback_id,
+            "▶️ ارسال خودکار فعال شد."
+        )
+
+        edit_message(
+            chat_id,
+            message_id,
+            admin_panel_text(),
+            admin_keyboard()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # Interval menu
+    # -----------------------------------------------------
+
+    if data == "interval":
+
+        answer_callback(
+            callback_id,
+            "زمان ارسال را انتخاب کنید."
+        )
+
+        edit_message(
+            chat_id,
+            message_id,
+            "⏱ <b>تنظیم فاصله ارسال</b>\n\n"
+            "فاصله موردنظر را انتخاب کنید:",
+            interval_keyboard()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # Back
+    # -----------------------------------------------------
+
+    if data == "admin_back":
+
+        answer_callback(
+            callback_id,
+            "بازگشت"
+        )
+
+        edit_message(
+            chat_id,
+            message_id,
+            admin_panel_text(),
+            admin_keyboard()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # Status
+    # -----------------------------------------------------
+
+    if data == "status":
+
+        answer_callback(
+            callback_id,
+            "وضعیت ربات"
+        )
+
+        edit_message(
+            chat_id,
+            message_id,
+            status_text(),
+            admin_keyboard()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # Interval values
+    # -----------------------------------------------------
+
+    if data.startswith(
+        "interval_"
+    ):
+
+        try:
+
+            minutes = int(
+                data.split(
+                    "_",
+                    1
+                )[1]
+            )
+
+        except (
+            ValueError,
+            IndexError
+        ):
+
+            answer_callback(
+                callback_id,
+                "خطای تنظیم زمان."
+            )
+
+            return
+
+        allowed = {
+            15,
+            30,
+            60,
+            120,
+            240,
+            360,
+            720,
+            1440,
+        }
+
+        if minutes not in allowed:
+
+            answer_callback(
+                callback_id,
+                "زمان نامعتبر است."
+            )
+
+            return
+
+        schedule = load_schedule()
+
+        schedule[
+            "interval_minutes"
+        ] = minutes
+
+        save_schedule(
+            schedule
+        )
+
+        answer_callback(
+            callback_id,
+            f"زمان روی "
+            f"{format_interval(minutes)} "
+            f"تنظیم شد."
+        )
+
+        edit_message(
+            chat_id,
+            message_id,
+            admin_panel_text(),
+            admin_keyboard()
         )
 
         return
 
     answer_callback(
         callback_id,
-        "در حال انجام..."
+        "دستور ناشناخته."
     )
 
-    data = callback.get(
-        "data",
+
+# =========================================================
+# HANDLE MESSAGE
+# =========================================================
+
+def handle_message(message):
+    from_user = message.get(
+        "from",
+        {}
+    )
+
+    user_id = from_user.get(
+        "id"
+    )
+
+    text = message.get(
+        "text",
         ""
     )
 
-    if data == "set_time":
-
-        send_message(
-            "⏱ <b>فاصله ارسال را انتخاب کن:</b>",
-            chat_id=chat_id,
-            reply_markup=time_keyboard()
-        )
-
+    if not text:
         return
 
-    if data == "send_now":
+    # Only admin can use /admin.
+    if text.startswith(
+        "/admin"
+    ):
 
-        ok = send_prices()
-
-        send_message(
-            "✅ قیمت‌ها ارسال و Pin شدند."
-            if ok
-            else
-            "❌ ارسال قیمت ناموفق بود.",
-            chat_id=chat_id
-        )
-
-        return
-
-    if data == "pause":
-
-        schedule = load_schedule()
-
-        schedule["enabled"] = False
-
-        save_schedule(schedule)
-
-        send_message(
-            "⏸ ارسال خودکار متوقف شد.",
-            chat_id=chat_id
-        )
-
-        return
-
-    if data == "resume":
-
-        schedule = load_schedule()
-
-        schedule["enabled"] = True
-
-        save_schedule(schedule)
-
-        send_message(
-            "▶️ ارسال خودکار فعال شد.",
-            chat_id=chat_id
-        )
-
-        return
-
-    if data == "status":
-
-        show_status(chat_id)
-        return
-
-    if data.startswith("time_"):
-
-        try:
-
-            minutes = int(
-                data.replace(
-                    "time_",
-                    ""
-                )
-            )
-
-            set_interval(
-                minutes,
-                chat_id
-            )
-
-        except Exception as e:
+        if not is_admin(user_id):
 
             print(
-                "Callback time error:",
-                e
+                f"Unauthorized /admin "
+                f"attempt from user {user_id}"
             )
+
+            return
+
+        chat = message.get(
+            "chat",
+            {}
+        )
+
+        chat_type = chat.get(
+            "type"
+        )
+
+        # Admin panel should be private.
+        if chat_type != "private":
+
+            print(
+                "Ignoring /admin outside "
+                "private chat."
+            )
+
+            return
+
+        chat_id = chat.get(
+            "id"
+        )
+
+        send_admin_panel(
+            chat_id
+        )
 
 
 # =========================================================
-# TELEGRAM OFFSET
+# UPDATE OFFSET
 # =========================================================
 
 def load_offset():
-
     data = load_json(
         OFFSET_FILE,
-        {"offset": 0}
+        {
+            "offset": 0
+        }
     )
 
     try:
-
         return int(
             data.get(
                 "offset",
@@ -1180,14 +2027,15 @@ def load_offset():
             )
         )
 
-    except Exception:
-
+    except (
+        ValueError,
+        TypeError
+    ):
         return 0
 
 
 def save_offset(offset):
-
-    save_json(
+    return save_json(
         OFFSET_FILE,
         {
             "offset": int(offset)
@@ -1196,49 +2044,104 @@ def save_offset(offset):
 
 
 # =========================================================
-# POLLING
+# PROCESS UPDATES
 # =========================================================
 
-def get_updates(offset):
+def process_updates(updates):
+    for update in updates:
 
-    result = telegram(
-        "getUpdates",
-        {
-            "offset": offset,
-            "timeout": 5,
-            "allowed_updates": json.dumps(
-                [
-                    "message",
-                    "callback_query"
-                ]
+        try:
+
+            if "callback_query" in update:
+
+                handle_callback(
+                    update[
+                        "callback_query"
+                    ]
+                )
+
+            elif "message" in update:
+
+                handle_message(
+                    update["message"]
+                )
+
+        except Exception as exc:
+
+            print(
+                "Error processing update:",
+                exc
             )
-        },
-        timeout=12
-    )
-
-    return result or []
 
 
-def poll_updates(seconds):
+# =========================================================
+# TELEGRAM POLLING
+# =========================================================
+
+def poll_telegram():
+    """
+    Poll Telegram for approximately 60 seconds.
+
+    This keeps the admin panel responsive during
+    each GitHub Actions execution.
+    """
 
     print(
-        f"Telegram polling for {seconds} seconds..."
+        f"Starting Telegram polling "
+        f"for {POLL_SECONDS} seconds..."
     )
+
+    started_at = time.time()
 
     offset = load_offset()
 
-    started = time.time()
-
     while (
-        time.time() - started
-        < seconds
+        time.time() - started_at
+        < POLL_SECONDS
     ):
 
-        updates = get_updates(
-            offset
+        remaining = (
+            POLL_SECONDS
+            - (
+                time.time()
+                - started_at
+            )
         )
 
-        for update in updates:
+        if remaining <= 0:
+            break
+
+        timeout = min(
+            20,
+            max(
+                1,
+                int(remaining)
+            )
+        )
+
+        result = telegram(
+            "getUpdates",
+            {
+                "offset": offset,
+                "timeout": timeout,
+                "allowed_updates": [
+                    "message",
+                    "callback_query",
+                ],
+            }
+        )
+
+        if result is None:
+
+            time.sleep(2)
+
+            continue
+
+        if not result:
+
+            continue
+
+        for update in result:
 
             update_id = update.get(
                 "update_id"
@@ -1246,37 +2149,45 @@ def poll_updates(seconds):
 
             if update_id is not None:
 
-                offset = max(
-                    offset,
-                    int(update_id) + 1
+                offset = (
+                    int(update_id)
+                    + 1
                 )
 
-            try:
-
-                if "message" in update:
-
-                    handle_message(
-                        update["message"]
-                    )
-
-                elif "callback_query" in update:
-
-                    handle_callback(
-                        update["callback_query"]
-                    )
-
-            except Exception as e:
-
-                print(
-                    "Update error:",
-                    e
+                save_offset(
+                    offset
                 )
 
-        if updates:
+        process_updates(
+            result
+        )
 
-            save_offset(offset)
+    print(
+        "Telegram polling finished."
+    )
 
-        time.sleep(1)
+
+# =========================================================
+# DELETE WEBHOOK
+# =========================================================
+
+def delete_webhook():
+    result = telegram(
+        "deleteWebhook",
+        {
+            "drop_pending_updates": False
+        }
+    )
+
+    if result:
+        print(
+            "Telegram webhook removed."
+        )
+
+    else:
+        print(
+            "Could not confirm webhook removal."
+        )
 
 
 # =========================================================
@@ -1285,83 +2196,116 @@ def poll_updates(seconds):
 
 def main():
 
+    print("")
     print("=" * 60)
     print("TELEGRAM PRICE BOT")
     print("=" * 60)
 
-    if not BOT_TOKEN:
-
-        print(
-            "ERROR: BOT_TOKEN missing"
-        )
-
-        return
-
-    if not CHAT_ID:
-
-        print(
-            "ERROR: CHAT_ID missing"
-        )
-
-        return
-
-    if not ADMIN_IDS:
-
-        print(
-            "WARNING: ADMIN_ID missing"
-        )
-
-    # حذف webhook برای اینکه getUpdates کار کند
-    telegram(
-        "deleteWebhook",
-        timeout=10
-    )
-
-    # -------------------------
-    # AUTOMATIC SEND
-    # -------------------------
-
-    if automatic_send_due():
-
-        print(
-            "Automatic price sending is DUE."
-        )
-
-        send_prices()
-
-    else:
-
-        schedule = load_schedule()
-
-        print(
-            "Automatic price sending is NOT due."
-        )
-
-        print(
-            "Interval:",
-            schedule["interval_minutes"],
-            "minutes"
-        )
-
-        print(
-            "Last:",
-            schedule.get(
-                "last_sent_at"
-            )
-        )
-
-    # -------------------------
-    # KEEP BOT ALIVE
-    # -------------------------
-
-    poll_updates(
-        POLL_SECONDS
+    print(
+        f"Tehran time: "
+        f"{tehran_now().isoformat()}"
     )
 
     print(
-        "Workflow finished."
+        f"State version: "
+        f"{STATE_VERSION}"
     )
 
+    print(
+        f"Poll duration: "
+        f"{POLL_SECONDS} seconds"
+    )
+
+    print("=" * 60)
+    print("")
+
+    # -----------------------------------------------------
+    # Telegram setup
+    # -----------------------------------------------------
+
+    delete_webhook()
+
+    # -----------------------------------------------------
+    # Automatic price sending
+    # -----------------------------------------------------
+
+    try:
+
+        if automatic_send_due():
+
+            print(
+                "Automatic price update is due."
+            )
+
+            success = send_prices()
+
+            if success:
+
+                mark_automatic_send()
+
+                print(
+                    "Automatic send completed."
+                )
+
+            else:
+
+                print(
+                    "Automatic send did not "
+                    "complete successfully."
+                )
+
+        else:
+
+            schedule = load_schedule()
+
+            print(
+                "Automatic send is not due."
+            )
+
+            print(
+                f"Enabled: "
+                f"{schedule['enabled']}"
+            )
+
+            print(
+                f"Interval: "
+                f"{format_interval("
+                    schedule['interval_minutes']
+                )}"
+            )
+
+    except Exception as exc:
+
+        print(
+            "Automatic sending error:",
+            exc
+        )
+
+    # -----------------------------------------------------
+    # Telegram admin polling
+    # -----------------------------------------------------
+
+    try:
+
+        poll_telegram()
+
+    except Exception as exc:
+
+        print(
+            "Polling error:",
+            exc
+        )
+
+    print("")
+    print(
+        "Bot run finished."
+    )
+    print("")
+
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
 
 if __name__ == "__main__":
     main()
