@@ -20,6 +20,7 @@ GOLD_URL = "https://gem.tgju.org/profile/geram18"
 SCHEDULE_FILE = "schedule.json"
 STATE_FILE = "price_state.json"
 OFFSET_FILE = "telegram_offset.json"
+GROUPS_FILE = "groups.json"
 
 # GitHub Actions runs every 5 minutes. Each run keeps Telegram polling alive
 # for 4 minutes, leaving a small safety gap before the next scheduled run.
@@ -206,11 +207,11 @@ def telegram(method: str, payload: Optional[Dict[str, Any]] = None) -> Any:
     return data.get("result")
 
 
-def send_message(text: str) -> Dict[str, Any]:
+def send_message(text: str, chat_id: Optional[str] = None) -> Dict[str, Any]:
     return telegram(
         "sendMessage",
         {
-            "chat_id": CHAT_ID,
+            "chat_id": chat_id or CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
@@ -218,11 +219,11 @@ def send_message(text: str) -> Dict[str, Any]:
     )
 
 
-def pin_message(message_id: int) -> None:
+def pin_message(message_id: int, chat_id: Optional[str] = None) -> None:
     telegram(
         "pinChatMessage",
         {
-            "chat_id": CHAT_ID,
+            "chat_id": chat_id or CHAT_ID,
             "message_id": message_id,
             "disable_notification": True,
         },
@@ -301,64 +302,80 @@ def build_gold_message() -> str:
     date_text = jdt.strftime("%Y/%m/%d")
     time_text = jdt.strftime("%H:%M:%S")
     return (
-        "🪙 <b>طلای ۱۸ عیار</b>\\n\\n"
-        "گرونه به توچه\\n\\n"
+        "🪙 <b>طلای ۱۸ عیار</b>\n\n"
+        "گرونه به توچه\n\n"
         f"🕐 {date_text} | {time_text}"
     )
 
 
+def load_groups() -> Dict[str, Dict[str, Any]]:
+    raw = load_json(GROUPS_FILE, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    if CHAT_ID and CHAT_ID not in raw:
+        raw[CHAT_ID] = {"title": "گروه اصلی", "active": True}
+    return raw
+
+
+def save_groups(groups: Dict[str, Dict[str, Any]]) -> None:
+    save_json(GROUPS_FILE, groups)
+
+
+def register_group(chat: Dict[str, Any]) -> None:
+    chat_id = str(chat.get("id", ""))
+    if not chat_id:
+        return
+    groups = load_groups()
+    groups[chat_id] = {"title": chat.get("title") or chat.get("username") or "گروه تلگرام", "active": True}
+    save_groups(groups)
+    try:
+        send_message("✅ ربات فعال شد! از این به بعد قیمت دلار و پیام طلای ۱۸ عیار در این گروه ارسال می‌شود.\n🪙 گرونه به توچه", chat_id)
+    except Exception as error:
+        print(f"GROUP WELCOME ERROR {chat_id}: {error}")
+    print(f"REGISTERED GROUP: {chat_id}")
+
+
 def send_prices() -> bool:
     state = load_state()
-    sent_any = False
-
-    # Dollar price is still fetched and reported normally.
+    groups = load_groups()
+    destinations = [(gid, info) for gid, info in groups.items() if info.get("active", True)]
+    if not destinations:
+        print("NO ACTIVE GROUPS")
+        return False
     try:
-        current = get_market_price("usd")
-        previous = state.get("usd")
-
-        if suspicious_change(previous, current):
-            print(
-                f"SKIP usd: suspicious jump "
-                f"previous={previous} current={current}"
-            )
-        else:
-            change = calculate_change(previous, current)
-            message = send_message(build_price_message("دلار آزاد", current, change))
-            try:
-                pin_message(int(message["message_id"]))
-            except Exception as pin_error:
-                print(f"PIN WARNING usd: {pin_error}")
-
-            state["usd"] = current
-            sent_any = True
-            print(
-                f"SENT usd: current={current} previous={previous} "
-                f"change={change}"
-            )
+        usd_current = get_market_price("usd")
     except Exception as error:
+        usd_current = None
         print(f"PRICE ERROR usd: {error}")
-
-    # Gold is deliberately never fetched, calculated, or disclosed.
-    # Every scheduled/manual inquiry sends only the requested fixed phrase.
-    try:
-        message = send_message(build_gold_message())
+    sent_any = False
+    for chat_id, info in destinations:
         try:
-            pin_message(int(message["message_id"]))
-        except Exception as pin_error:
-            print(f"PIN WARNING gold: {pin_error}")
-
-        state["gold"] = None
-        sent_any = True
-        print("SENT gold: fixed text only; no price disclosed")
-    except Exception as error:
-        print(f"PRICE ERROR gold message: {error}")
-
+            if usd_current is not None:
+                previous = state.get("usd")
+                if not suspicious_change(previous, usd_current):
+                    change = calculate_change(previous, usd_current)
+                    message = send_message(build_price_message("دلار آزاد", usd_current, change), chat_id)
+                    try:
+                        pin_message(int(message["message_id"]), chat_id)
+                    except Exception as pin_error:
+                        print(f"PIN WARNING usd {chat_id}: {pin_error}")
+                    sent_any = True
+            gold_message = send_message(build_gold_message(), chat_id)
+            try:
+                pin_message(int(gold_message["message_id"]), chat_id)
+            except Exception as pin_error:
+                print(f"PIN WARNING gold {chat_id}: {pin_error}")
+            sent_any = True
+            print(f"SENT updates to group {chat_id}")
+        except Exception as error:
+            print(f"GROUP SEND ERROR {chat_id}: {error}")
+    if usd_current is not None:
+        state["usd"] = usd_current
     if sent_any:
+        state["gold"] = None
         state["updated_at"] = now_tehran().isoformat()
         save_json(STATE_FILE, state)
-
     return sent_any
-
 
 def schedule_due(schedule: Dict[str, Any]) -> bool:
     if not schedule["enabled"]:
@@ -562,7 +579,7 @@ def poll_updates() -> None:
                 {
                     "offset": offset,
                     "timeout": timeout,
-                    "allowed_updates": ["message", "callback_query"],
+                    "allowed_updates": ["message", "callback_query", "my_chat_member"],
                 },
             )
 
