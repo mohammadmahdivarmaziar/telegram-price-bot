@@ -553,6 +553,20 @@ def handle_message(message: Dict[str, Any]) -> None:
     if str(sender.get("id")) != ADMIN_ID:
         return
 
+    if text in ("/start", "/link") and chat.get("type") == "private":
+        try:
+            me = telegram("getMe")
+            username = me.get("username", "")
+            link = f"https://t.me/{username}?startgroup=true" if username else "لینک در دسترس نیست"
+            telegram("sendMessage", {
+                "chat_id": chat["id"],
+                "text": f"🔗 لینک افزودن ربات به گروه:\n{link}",
+                "disable_web_page_preview": True,
+            })
+        except Exception as error:
+            print(f"GROUP LINK ERROR: {error}")
+        return
+
     if text == "/admin" and chat.get("type") == "private":
         telegram(
             "sendMessage",
@@ -591,6 +605,18 @@ def poll_updates() -> None:
                     handle_message(update["message"])
                 elif "callback_query" in update:
                     handle_callback(update["callback_query"])
+                elif "my_chat_member" in update:
+                    membership = update["my_chat_member"]
+                    chat = membership.get("chat") or {}
+                    status = (membership.get("new_chat_member") or {}).get("status")
+                    if chat.get("type") in ("group", "supergroup"):
+                        if status in ("member", "administrator"):
+                            register_group(chat)
+                        elif status in ("left", "kicked"):
+                            groups = load_groups()
+                            groups.pop(str(chat.get("id")), None)
+                            save_groups(groups)
+                            print(f"REMOVED GROUP: {chat.get('id')}")
 
         except requests.RequestException as error:
             print(f"POLL NETWORK ERROR: {error}")
@@ -614,6 +640,8 @@ def main() -> None:
     except Exception as error:
         print(f"WEBHOOK WARNING: {error}")
 
+    # Preserve the original destination and initialize the multi-group registry.
+    save_groups(load_groups())
     schedule = load_schedule()
 
     # A manual GitHub Actions run always sends immediately. Scheduled runs
