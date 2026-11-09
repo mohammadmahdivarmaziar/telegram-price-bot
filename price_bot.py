@@ -296,47 +296,62 @@ def save_schedule(schedule: Dict[str, Any]) -> None:
     save_json(SCHEDULE_FILE, schedule)
 
 
+def build_gold_message() -> str:
+    jdt = jalali_now()
+    date_text = jdt.strftime("%Y/%m/%d")
+    time_text = jdt.strftime("%H:%M:%S")
+    return (
+        "🪙 <b>طلای ۱۸ عیار</b>\\n\\n"
+        "گرونه به توچه\\n\\n"
+        f"🕐 {date_text} | {time_text}"
+    )
+
+
 def send_prices() -> bool:
     state = load_state()
     sent_any = False
 
-    assets = [
-        ("usd", "دلار آزاد"),
-        ("gold", "طلای ۱۸ عیار"),
-    ]
+    # Dollar price is still fetched and reported normally.
+    try:
+        current = get_market_price("usd")
+        previous = state.get("usd")
 
-    for kind, title in assets:
-        try:
-            current = get_market_price(kind)
-            previous = state.get(kind)
-
-            if suspicious_change(previous, current):
-                print(
-                    f"SKIP {kind}: suspicious jump "
-                    f"previous={previous} current={current}"
-                )
-                continue
-
+        if suspicious_change(previous, current):
+            print(
+                f"SKIP usd: suspicious jump "
+                f"previous={previous} current={current}"
+            )
+        else:
             change = calculate_change(previous, current)
-            text = build_price_message(title, current, change)
-            message = send_message(text)
-
+            message = send_message(build_price_message("دلار آزاد", current, change))
             try:
                 pin_message(int(message["message_id"]))
             except Exception as pin_error:
-                # The message is still a valid sent price; don't discard it
-                # just because a pin failed temporarily.
-                print(f"PIN WARNING {kind}: {pin_error}")
+                print(f"PIN WARNING usd: {pin_error}")
 
-            state[kind] = current
+            state["usd"] = current
             sent_any = True
-
             print(
-                f"SENT {kind}: current={current} previous={previous} "
+                f"SENT usd: current={current} previous={previous} "
                 f"change={change}"
             )
-        except Exception as error:
-            print(f"PRICE ERROR {kind}: {error}")
+    except Exception as error:
+        print(f"PRICE ERROR usd: {error}")
+
+    # Gold is deliberately never fetched, calculated, or disclosed.
+    # Every scheduled/manual inquiry sends only the requested fixed phrase.
+    try:
+        message = send_message(build_gold_message())
+        try:
+            pin_message(int(message["message_id"]))
+        except Exception as pin_error:
+            print(f"PIN WARNING gold: {pin_error}")
+
+        state["gold"] = None
+        sent_any = True
+        print("SENT gold: fixed text only; no price disclosed")
+    except Exception as error:
+        print(f"PRICE ERROR gold message: {error}")
 
     if sent_any:
         state["updated_at"] = now_tehran().isoformat()
@@ -414,7 +429,7 @@ def status_text() -> str:
     interval = INTERVALS[schedule["interval_minutes"]]
     last = schedule["last_sent_at"] or "هنوز ارسال نشده"
     usd = f"{state['usd']:,} تومان" if state.get("usd") else "ثبت نشده"
-    gold = f"{state['gold']:,} تومان" if state.get("gold") else "ثبت نشده"
+    gold = "گرونه به توچه"
 
     return (
         "⚙️ <b>پنل مدیریت ربات</b>\n\n"
